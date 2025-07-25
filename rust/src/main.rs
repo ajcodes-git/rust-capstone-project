@@ -1,11 +1,14 @@
 #![allow(unused)]
-use bitcoin::hex::DisplayHex;
 use bitcoincore_rpc::bitcoin::Amount;
+use bitcoincore_rpc::bitcoin::{Address, Network};
+use bitcoincore_rpc::jsonrpc;
+use bitcoincore_rpc::Error as RpcError;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use serde::Deserialize;
 use serde_json::json;
 use std::fs::File;
 use std::io::Write;
+use std::str::FromStr;
 
 // Node access params
 const RPC_URL: &str = "http://127.0.0.1:18443"; // Default regtest RPC port
@@ -41,11 +44,9 @@ fn main() -> bitcoincore_rpc::Result<()> {
         Auth::UserPass(RPC_USER.to_owned(), RPC_PASS.to_owned()),
     )?;
 
-
     // Get blockchain info
     let blockchain_info = rpc.get_blockchain_info()?;
     println!("Blockchain Info: {:?}", blockchain_info);
-
 
     // ================= 1. Ensure both "Miner" and "Trader" wallets are available by creating or loading them=====================
     for wallet in ["Miner", "Trader"] {
@@ -58,7 +59,6 @@ fn main() -> bitcoincore_rpc::Result<()> {
             let _ = rpc.call::<serde_json::Value>("loadwallet", &[json!(wallet)]);
         }
     }
-    
 
     // Initialize RPC clients for wallet-specific operations (Miner and Trader wallets)
     let miner_rpc = Client::new(
@@ -70,38 +70,40 @@ fn main() -> bitcoincore_rpc::Result<()> {
         &format!("{RPC_URL}/wallet/Trader"),
         Auth::UserPass(RPC_USER.to_owned(), RPC_PASS.to_owned()),
     )?;
-    
-    //Generate a new address in the "Miner" wallet to receive mining rewards
-    let mining_address = miner_rpc.call::<String>("getnewaddress", &[json!("Mining Reward")])?;
 
+    //Generate a new address in the "Miner" wallet to receive mining rewards
+    let mining_address_str =
+        miner_rpc.call::<String>("getnewaddress", &[json!("Mining Reward")])?;
+    let mining_address = Address::from_str(&mining_address_str).map_err(|e| {
+        eprintln!("Address parse error: {e}");
+        RpcError::UnexpectedStructure
+    })?;
+    let mining_address = mining_address
+        .require_network(Network::Regtest)
+        .map_err(|e| {
+            eprintln!("Network error: {e}");
+            RpcError::UnexpectedStructure
+        })?;
 
     // ============== 2. Generate initial balance by mining 103 blocks to the Miner address=====================
     // 100 blocks for coinbase maturity + 3 for spendable balance
     // 103 blocks: Coinbase transactions require 100 confirmations before the mined BTC can be spent.
-    rpc.generate_to_address(103, &mining_address.parse()?)?;
-
+    rpc.generate_to_address(103, &mining_address)?;
 
     // =================== 3. Generate a receiving address in the Trader wallet=========================
     let trader_address = trader_rpc.call::<String>("getnewaddress", &[json!("Trader Address")])?;
 
-
     // ================= 4. send 20 BTC from Miner to Trader====================
-    let txid = miner_rpc.call::<String>(
-        "sendtoaddress",
-        &[json!(trader_address), json!(20.0)],
-    )?;
+    let txid = miner_rpc.call::<String>("sendtoaddress", &[json!(trader_address), json!(20.0)])?;
     println!("Transaction ID: {}", txid);
 
-
     // ================ 5. Check if transaction is in the mempool=========================
-    let mempool = rpc.get_raw_mempool()?;
-    assert!(mempool.contains(&txid.parse()?));
-    println!("Transaction is in the mempool.");
-
+    let mempool_entry =
+        miner_rpc.call::<serde_json::Value>("getmempoolentry", &[json!(txid.clone())])?;
+    println!("Mempool entry: {mempool_entry:?}");
 
     // ================ 6. Mine 1 block to confirm the transaction===========================
-    let _ = rpc.generate_to_address(1, &mining_addr.parse()?)?;
-
+    let _ = rpc.generate_to_address(1, &mining_address)?;
 
     // ============== 7. Retrieve and safely extract relevant transaction details from the Miner wallet=====================
     let tx_info = miner_rpc.call::<serde_json::Value>(
@@ -173,7 +175,6 @@ fn main() -> bitcoincore_rpc::Result<()> {
             }
         }
     }
-
 
     // ========== 8. Write all extracted transaction details to ../out.txt in the required output format==============
     let mut file = File::create("../out.txt").expect("Unable to create out.txt");
