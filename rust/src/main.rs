@@ -46,7 +46,7 @@ fn main() -> bitcoincore_rpc::Result<()> {
 
     // Get blockchain info
     let blockchain_info = rpc.get_blockchain_info()?;
-    println!("Blockchain Info: {:?}", blockchain_info);
+    println!("Blockchain Info: {blockchain_info:?}");
 
     // ================= 1. Ensure both "Miner" and "Trader" wallets are available by creating or loading them=====================
     for wallet in ["Miner", "Trader"] {
@@ -95,7 +95,7 @@ fn main() -> bitcoincore_rpc::Result<()> {
 
     // ================= 4. send 20 BTC from Miner to Trader====================
     let txid = miner_rpc.call::<String>("sendtoaddress", &[json!(trader_address), json!(20.0)])?;
-    println!("Transaction ID: {}", txid);
+    println!("Transaction ID: {txid}");
 
     // ================ 5. Check if transaction is in the mempool=========================
     let mempool_entry =
