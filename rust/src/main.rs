@@ -41,71 +41,69 @@ fn main() -> bitcoincore_rpc::Result<()> {
         Auth::UserPass(RPC_USER.to_owned(), RPC_PASS.to_owned()),
     )?;
 
-    // Helper to call wallet-specific RPC
+
+    // Get blockchain info
+    let blockchain_info = rpc.get_blockchain_info()?;
+    println!("Blockchain Info: {:?}", blockchain_info);
+
+
+    // ================= 1. Ensure both "Miner" and "Trader" wallets are available by creating or loading them=====================
+    for wallet in ["Miner", "Trader"] {
+        let response = rpc.call::<serde_json::Value>("createwallet", &[json!(wallet)]);
+        if let Err(e) = &response {
+            if !e.to_string().contains("already exists") {
+                panic!("Failed to create wallet: {e}");
+            }
+            // If the wallet already exists, attempt to load it in case it's not currently loaded
+            let _ = rpc.call::<serde_json::Value>("loadwallet", &[json!(wallet)]);
+        }
+    }
+    
+
+    // Initialize RPC clients for wallet-specific operations (Miner and Trader wallets)
     let miner_rpc = Client::new(
         &format!("{RPC_URL}/wallet/Miner"),
         Auth::UserPass(RPC_USER.to_owned(), RPC_PASS.to_owned()),
     )?;
+
     let trader_rpc = Client::new(
         &format!("{RPC_URL}/wallet/Trader"),
         Auth::UserPass(RPC_USER.to_owned(), RPC_PASS.to_owned()),
     )?;
+    
+    //Generate a new address in the "Miner" wallet to receive mining rewards
+    let mining_address = miner_rpc.call::<String>("getnewaddress", &[json!("Mining Reward")])?;
 
-    // 1. Create/load wallets
-    for wallet in ["Miner", "Trader"] {
-        let res = rpc.call::<serde_json::Value>("createwallet", &[json!(wallet)]);
-        if let Err(e) = &res {
-            if !e.to_string().contains("already exists") {
-                panic!("Failed to create wallet: {e}");
-            }
-            // Try loading if not loaded
-            let _ = rpc.call::<serde_json::Value>("loadwallet", &[json!(wallet)]);
-        }
-    }
 
-    // 2. Generate address for mining reward in Miner wallet
-    let mining_addr = miner_rpc.call::<String>("getnewaddress", &[json!("Mining Reward")])?;
+    // ============== 2. Generate initial balance by mining 103 blocks to the Miner address=====================
+    // 100 blocks for coinbase maturity + 3 for spendable balance
+    // 103 blocks: Coinbase transactions require 100 confirmations before the mined BTC can be spent.
+    rpc.generate_to_address(103, &mining_address.parse()?)?;
 
-    // 3. Mine blocks until positive balance but only enough to have ONE large UTXO
-    // Coinbase rewards require 100 blocks to mature before spendable
-    let mut blocks_mined = 0;
-    let mut miner_balance = miner_rpc.get_balance(None, None)?;
 
-    // Mine exactly 101 blocks to get one mature UTXO
-    while blocks_mined < 101 || miner_balance.to_btc() <= 0.0 {
-        miner_rpc
-            .call::<Vec<String>>("generatetoaddress", &[json!(1), json!(mining_addr.clone())])?;
-        blocks_mined += 1;
-        miner_balance = miner_rpc.get_balance(None, None)?;
+    // =================== 3. Generate a receiving address in the Trader wallet=========================
+    let trader_address = trader_rpc.call::<String>("getnewaddress", &[json!("Trader Address")])?;
 
-        // Stop after 101 blocks to ensure we have only one spendable UTXO
-        if blocks_mined >= 101 && miner_balance.to_btc() > 0.0 {
-            break;
-        }
-    }
-    // Coinbase rewards are only spendable after 100 blocks (maturity)
-    // This is to prevent chain reorganizations from invalidating coinbase spends.
 
-    println!("Blocks mined until positive balance: {blocks_mined}");
-    println!("Miner wallet balance: {} BTC", miner_balance.to_btc());
+    // ================= 4. send 20 BTC from Miner to Trader====================
+    let txid = miner_rpc.call::<String>(
+        "sendtoaddress",
+        &[json!(trader_address), json!(20.0)],
+    )?;
+    println!("Transaction ID: {}", txid);
 
-    // 4. Generate Trader receiving address
-    let trader_addr = trader_rpc.call::<String>("getnewaddress", &[json!("Received")])?;
 
-    // 5. Send 20 BTC from Miner to Trader
-    let txid =
-        miner_rpc.call::<String>("sendtoaddress", &[json!(trader_addr.clone()), json!(20.0)])?;
-    println!("Sent 20 BTC from Miner to Trader. TXID: {txid}");
+    // ================ 5. Check if transaction is in the mempool=========================
+    let mempool = rpc.get_raw_mempool()?;
+    assert!(mempool.contains(&txid.parse()?));
+    println!("Transaction is in the mempool.");
 
-    // 6. Fetch unconfirmed transaction from mempool
-    let mempool_entry =
-        miner_rpc.call::<serde_json::Value>("getmempoolentry", &[json!(txid.clone())])?;
-    println!("Mempool entry: {mempool_entry:?}");
 
-    // 7. Mine 1 block to confirm transaction
-    miner_rpc.call::<Vec<String>>("generatetoaddress", &[json!(1), json!(mining_addr.clone())])?;
+    // ================ 6. Mine 1 block to confirm the transaction===========================
+    let _ = rpc.generate_to_address(1, &mining_addr.parse()?)?;
 
-    // 8. Extract transaction details with proper error handling
+
+    // ============== 7. Retrieve and safely extract relevant transaction details from the Miner wallet=====================
     let tx_info = miner_rpc.call::<serde_json::Value>(
         "gettransaction",
         &[json!(txid.clone()), json!(null), json!(true)],
@@ -115,12 +113,12 @@ fn main() -> bitcoincore_rpc::Result<()> {
     let blockhash = tx_info["blockhash"].as_str().unwrap_or("unknown");
     let fee = tx_info["fee"].as_f64().unwrap_or(0.0);
 
-    // Find input address and amount - get actual input transaction details
+    // Extract input transaction ID and output index from the decoded transaction
     let vin = decoded["vin"].as_array().unwrap();
     let input_txid = vin[0]["txid"].as_str().unwrap();
     let input_vout = vin[0]["vout"].as_u64().unwrap() as usize;
 
-    // Get the previous transaction to find the input details
+    // Fetch the previous transaction to trace back the source of the input funds
     let input_tx = miner_rpc.call::<serde_json::Value>(
         "gettransaction",
         &[json!(input_txid), json!(null), json!(true)],
@@ -129,7 +127,7 @@ fn main() -> bitcoincore_rpc::Result<()> {
     let input_vouts = input_decoded["vout"].as_array().unwrap();
     let input_vout_obj = &input_vouts[input_vout];
 
-    // Safely extract input address and amount
+    // Extract the originating address of the input, falling back to script info if address is unavailable
     let miner_input_address = if let Some(addr_val) = input_vout_obj["scriptPubKey"].get("address")
     {
         if let Some(addr_str) = addr_val.as_str() {
@@ -149,7 +147,7 @@ fn main() -> bitcoincore_rpc::Result<()> {
 
     let miner_input_amount = input_vout_obj["value"].as_f64().unwrap_or(0.0);
 
-    // Find output addresses and amounts - handle all edge cases safely
+    // Parse transaction outputs to identify recipient (Trader) and change (Miner) addresses and amounts
     let vout = decoded["vout"].as_array().unwrap();
     let mut trader_output_address = "";
     let mut trader_output_amount = 0.0;
@@ -157,17 +155,18 @@ fn main() -> bitcoincore_rpc::Result<()> {
     let mut miner_change_amount = 0.0;
 
     for out in vout {
-        // Only process outputs with valid value field
+        // Safely extract the output amount
         if let Some(value) = out.get("value").and_then(|v| v.as_f64()) {
-            // Only process outputs with valid address field
-            if let Some(addr_val) = out["scriptPubKey"].get("address") {
-                if let Some(addr) = addr_val.as_str() {
-                    if addr == trader_addr {
-                        trader_output_address = addr;
+            // Safely extract the destination address, if available
+            if let Some(address_value) = out["scriptPubKey"].get("address") {
+                if let Some(address) = address_value.as_str() {
+                    if address == trader_address {
+                        // This is the recipient (Trader) output
+                        trader_output_address = address;
                         trader_output_amount = value;
-                    } else if addr != trader_addr {
-                        // Any address that's not the trader address is considered change
-                        miner_change_address = addr;
+                    } else if address != trader_address {
+                        // Any address that's not the Trader's is treated as change (likely to Miner)
+                        miner_change_address = address;
                         miner_change_amount = value;
                     }
                 }
@@ -175,7 +174,8 @@ fn main() -> bitcoincore_rpc::Result<()> {
         }
     }
 
-    // 9. Write output to ../out.txt
+
+    // ========== 8. Write all extracted transaction details to ../out.txt in the required output format==============
     let mut file = File::create("../out.txt").expect("Unable to create out.txt");
     writeln!(file, "{txid}")?;
     writeln!(file, "{miner_input_address}")?;
